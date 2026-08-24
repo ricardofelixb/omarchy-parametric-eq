@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -123,7 +124,81 @@ Filter 3: ON HP Fc 25 Hz Q 0.900
         self.assertTrue(filename.endswith(".json"))
 
 
+class StateFileSecurityTests(unittest.TestCase):
+    def setUp(self):
+        peqctl.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        for path in (peqctl.STATE_FILE, peqctl.STATE_DIR / ".lock"):
+            path.unlink(missing_ok=True)
+
+    def test_state_symlink_is_replaced_without_touching_target(self):
+        target = Path(TEST_ROOT.name) / "external-state.json"
+        target.write_text('{"external": true}\n', encoding="utf-8")
+        peqctl.STATE_FILE.symlink_to(target)
+
+        state = peqctl.load_state()
+
+        self.assertEqual(state, peqctl.default_state())
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"external": true}\n')
+        self.assertFalse(peqctl.STATE_FILE.is_symlink())
+        self.assertEqual(peqctl.STATE_FILE.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(peqctl.STATE_DIR.stat().st_mode & 0o777, 0o700)
+
+    def test_state_hardlink_is_replaced_without_touching_target(self):
+        target = Path(TEST_ROOT.name) / "linked-state.json"
+        target.write_text('{"external": true}\n', encoding="utf-8")
+        os.link(target, peqctl.STATE_FILE)
+
+        state = peqctl.load_state()
+
+        self.assertEqual(state, peqctl.default_state())
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"external": true}\n')
+        self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_non_regular_state_does_not_block(self):
+        os.mkfifo(peqctl.STATE_FILE)
+
+        state = peqctl.load_state()
+
+        self.assertEqual(state, peqctl.default_state())
+        self.assertTrue(peqctl.STATE_FILE.is_file())
+
+    def test_oversized_state_is_replaced_with_bounded_default(self):
+        peqctl.STATE_FILE.write_bytes(b"x" * (peqctl.MAX_STATE_BYTES + 1))
+
+        state = peqctl.load_state()
+
+        self.assertEqual(state, peqctl.default_state())
+        self.assertLess(peqctl.STATE_FILE.stat().st_size, peqctl.MAX_STATE_BYTES)
+
+    def test_directory_lock_creates_no_predictable_lock_file(self):
+        with peqctl.locked_state_directory():
+            pass
+
+        self.assertFalse((peqctl.STATE_DIR / ".lock").exists())
+
+
 class RuntimeCommandTests(unittest.TestCase):
+    def test_command_output_is_bounded(self):
+        command = [sys.executable, "-c", "import sys; sys.stdout.write('x' * 4096)"]
+        with self.assertRaisesRegex(peqctl.PeqError, "output exceeded 128 bytes"):
+            peqctl.run(command, max_output_bytes=128)
+
+    def test_command_capture_preserves_separate_streams(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('out'); sys.stderr.write('err')",
+        ]
+        result = peqctl.run(command)
+        self.assertEqual(result.stdout, "out")
+        self.assertEqual(result.stderr, "err")
+
+    def test_reviewer_blocked_patterns_do_not_regress(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("capture_output=True", source)
+        self.assertNotIn("LOCK_FILE", source)
+        self.assertNotIn("STATE_FILE.read_text", source)
+
     @mock.patch.object(peqctl, "find_node", return_value={"id": 72})
     @mock.patch.object(peqctl, "run")
     def test_live_update_uses_pipewire_props_without_shell(self, run_mock, _node_mock):

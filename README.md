@@ -85,6 +85,12 @@ created, removed, or structurally rebuilt. It refuses to replace a symlink,
 non-regular file, or fragment without the plugin ownership marker, and restores
 the previous managed fragment if a graph rebuild fails.
 
+The state directory is restricted to the current user. State reads are
+size-bounded, reject symlinks, hard links, and non-regular files, and remain
+attached to the opened file descriptor if a pathname changes. State writes use
+atomic descriptor-relative replacement. Output from PipeWire and systemd tools
+is also read incrementally under a fixed memory limit.
+
 ## Command line
 
 The panel uses `backend/peqctl.py`, which can also be called directly from the

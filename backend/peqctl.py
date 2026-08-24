@@ -9,6 +9,7 @@ fragment. Numeric edits are applied to the live filter-chain; topology changes
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import copy
 import fcntl
 import hashlib
@@ -17,12 +18,15 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
+import selectors
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Iterator
 
 
 PLUGIN_ID = "io.github.prudhviy99.parametric-eq"
@@ -43,6 +47,10 @@ TYPE_LABELS = {
 }
 GAIN_TYPES = {"bell", "low-shelf", "high-shelf"}
 DEFAULT_FREQUENCIES = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+MAX_STATE_BYTES = 256 * 1024
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
 
 
 def band(index: int, frequency: float, kind: str = "bell") -> dict[str, Any]:
@@ -98,7 +106,6 @@ def config_home() -> Path:
 STATE_DIR = Path(os.environ.get("OMARCHY_PEQ_STATE_DIR", config_home() / "omarchy" / "parametric-eq"))
 STATE_FILE = STATE_DIR / "state.json"
 PRESET_DIR = STATE_DIR / "presets"
-LOCK_FILE = STATE_DIR / ".lock"
 WP_FRAGMENT = Path(
     os.environ.get(
         "OMARCHY_PEQ_WP_FRAGMENT",
@@ -111,6 +118,10 @@ SHELL_CONFIG = Path(
 
 
 class PeqError(RuntimeError):
+    pass
+
+
+class _OutputLimitExceeded(RuntimeError):
     pass
 
 
@@ -216,41 +227,285 @@ def atomic_text(path: Path, content: str) -> None:
             os.unlink(temporary)
 
 
-def load_state() -> dict[str, Any]:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if not STATE_FILE.exists():
-        state = default_state()
-        atomic_json(STATE_FILE, state)
-        return state
+def _open_state_directory() -> int:
     try:
-        return sanitize_state(json.loads(STATE_FILE.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError, PeqError) as exc:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        quarantine = STATE_FILE.with_name(f"state.invalid-{stamp}.json")
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_fd = os.open(STATE_DIR, flags)
+    except OSError as exc:
+        raise PeqError(f"could not securely open state directory {STATE_DIR}: {exc}") from exc
+
+    try:
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise PeqError(f"state directory must be a user-owned real directory: {STATE_DIR}")
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(directory_fd, 0o700)
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+@contextmanager
+def locked_state_directory() -> Iterator[int]:
+    """Lock the private state directory itself; no substitutable lock path."""
+    directory_fd = _open_state_directory()
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        yield directory_fd
+    finally:
         try:
-            STATE_FILE.replace(quarantine)
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
         except OSError:
             pass
-        state = default_state()
-        atomic_json(STATE_FILE, state)
-        print(f"warning: replaced invalid state ({exc}); old file: {quarantine}", file=sys.stderr)
-        return state
+        os.close(directory_fd)
 
 
-def save_state(state: dict[str, Any]) -> None:
-    atomic_json(STATE_FILE, sanitize_state(state))
+def _read_bounded_text_fd(
+    file_fd: int,
+    *,
+    path: Path,
+    max_bytes: int,
+    require_owner: bool,
+    require_single_link: bool,
+    make_private: bool = False,
+) -> str:
+    metadata = os.fstat(file_fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PeqError(f"refusing to read non-regular file: {path}")
+    if require_owner and metadata.st_uid != os.geteuid():
+        raise PeqError(f"refusing to read file not owned by the current user: {path}")
+    if require_single_link and metadata.st_nlink != 1:
+        raise PeqError(f"refusing to read multiply-linked file: {path}")
+    if metadata.st_size > max_bytes:
+        raise PeqError(f"file exceeds the {max_bytes}-byte limit: {path}")
+    if make_private and stat.S_IMODE(metadata.st_mode) != 0o600:
+        os.fchmod(file_fd, 0o600)
 
-
-def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    chunks = bytearray()
+    while len(chunks) <= max_bytes:
+        chunk = os.read(file_fd, min(READ_CHUNK_BYTES, max_bytes + 1 - len(chunks)))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    if len(chunks) > max_bytes:
+        raise PeqError(f"file exceeds the {max_bytes}-byte limit: {path}")
     try:
-        return subprocess.run(command, check=check, text=True, capture_output=True, timeout=15)
+        return chunks.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PeqError(f"file is not valid UTF-8: {path}") from exc
+
+
+def read_bounded_text(
+    path: Path,
+    max_bytes: int,
+    *,
+    require_owner: bool = True,
+    require_single_link: bool = True,
+) -> str:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        file_fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PeqError(f"could not securely open {path}: {exc}") from exc
+    try:
+        return _read_bounded_text_fd(
+            file_fd,
+            path=path,
+            max_bytes=max_bytes,
+            require_owner=require_owner,
+            require_single_link=require_single_link,
+        )
+    finally:
+        os.close(file_fd)
+
+
+def _read_state_text(directory_fd: int) -> str:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        file_fd = os.open(STATE_FILE.name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PeqError(f"could not securely open state file {STATE_FILE}: {exc}") from exc
+    try:
+        return _read_bounded_text_fd(
+            file_fd,
+            path=STATE_FILE,
+            max_bytes=MAX_STATE_BYTES,
+            require_owner=True,
+            require_single_link=True,
+            make_private=True,
+        )
+    finally:
+        os.close(file_fd)
+
+
+def _atomic_state_json(directory_fd: int, value: Any) -> None:
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(payload) > MAX_STATE_BYTES:
+        raise PeqError(f"state exceeds the {MAX_STATE_BYTES}-byte limit")
+
+    temporary = f".{STATE_FILE.name}.{secrets.token_hex(12)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_fd = -1
+    replaced = False
+    try:
+        file_fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_fd, view)
+            view = view[written:]
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = -1
+        os.replace(temporary, STATE_FILE.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        replaced = True
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise PeqError(f"could not securely write state file {STATE_FILE}: {exc}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if not replaced:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def load_state(directory_fd: int | None = None) -> dict[str, Any]:
+    owns_directory_fd = directory_fd is None
+    if directory_fd is None:
+        directory_fd = _open_state_directory()
+    try:
+        try:
+            content = _read_state_text(directory_fd)
+        except FileNotFoundError:
+            state = default_state()
+            _atomic_state_json(directory_fd, state)
+            return state
+        try:
+            return sanitize_state(json.loads(content))
+        except (json.JSONDecodeError, PeqError) as exc:
+            state = default_state()
+            _atomic_state_json(directory_fd, state)
+            print(f"warning: replaced invalid state ({exc})", file=sys.stderr)
+            return state
+    except PeqError as exc:
+        state = default_state()
+        _atomic_state_json(directory_fd, state)
+        print(f"warning: replaced unsafe state ({exc})", file=sys.stderr)
+        return state
+    finally:
+        if owns_directory_fd:
+            os.close(directory_fd)
+
+
+def save_state(state: dict[str, Any], directory_fd: int | None = None) -> None:
+    owns_directory_fd = directory_fd is None
+    if directory_fd is None:
+        directory_fd = _open_state_directory()
+    try:
+        _atomic_state_json(directory_fd, sanitize_state(state))
+    finally:
+        if owns_directory_fd:
+            os.close(directory_fd)
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _bounded_process_output(
+    process: subprocess.Popen[bytes], timeout: float, max_output_bytes: int
+) -> tuple[bytes, bytes]:
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    deadline = time.monotonic() + timeout
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, stdout)
+    selector.register(process.stderr, selectors.EVENT_READ, stderr)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in events:
+                total = len(stdout) + len(stderr)
+                allowance = max_output_bytes + 1 - total
+                chunk = os.read(key.fd, min(READ_CHUNK_BYTES, max(1, allowance)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                key.data.extend(chunk)
+                if len(stdout) + len(stderr) > max_output_bytes:
+                    raise _OutputLimitExceeded
+        remaining = max(0.0, deadline - time.monotonic())
+        process.wait(timeout=remaining)
+        return bytes(stdout), bytes(stderr)
+    finally:
+        selector.close()
+
+
+def run(
+    command: list[str],
+    *,
+    check: bool = True,
+    timeout: float = 15,
+    max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    if max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
     except FileNotFoundError as exc:
         raise PeqError(f"required command not found: {command[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "unknown error").strip()
-        raise PeqError(f"{' '.join(command)} failed: {detail}") from exc
+    except OSError as exc:
+        raise PeqError(f"could not start {' '.join(command)}: {exc}") from exc
+
+    try:
+        stdout_bytes, stderr_bytes = _bounded_process_output(process, timeout, max_output_bytes)
+    except _OutputLimitExceeded as exc:
+        _terminate_process(process)
+        raise PeqError(f"{' '.join(command)} output exceeded {max_output_bytes} bytes") from exc
     except subprocess.TimeoutExpired as exc:
+        _terminate_process(process)
         raise PeqError(f"{' '.join(command)} timed out") from exc
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+    completed = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout_bytes.decode("utf-8", errors="replace"),
+        stderr_bytes.decode("utf-8", errors="replace"),
+    )
+    if check and completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown error").strip()
+        raise PeqError(f"{' '.join(command)} failed: {detail}")
+    return completed
 
 
 def topology_signature(state: dict[str, Any]) -> str:
@@ -350,16 +605,10 @@ wireplumber.components = [
 
 
 def managed_fragment_text() -> str | None:
-    if not WP_FRAGMENT.exists() and not WP_FRAGMENT.is_symlink():
-        return None
-    if WP_FRAGMENT.is_symlink():
-        raise PeqError(f"refusing to replace symlinked WirePlumber fragment: {WP_FRAGMENT}")
-    if not WP_FRAGMENT.is_file():
-        raise PeqError(f"WirePlumber fragment is not a regular file: {WP_FRAGMENT}")
     try:
-        content = WP_FRAGMENT.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise PeqError(f"could not read WirePlumber fragment {WP_FRAGMENT}: {exc}") from exc
+        content = read_bounded_text(WP_FRAGMENT, MAX_CONFIG_BYTES)
+    except FileNotFoundError:
+        return None
     if content.splitlines()[:1] != [FRAGMENT_MARKER]:
         raise PeqError(f"refusing to overwrite unrecognized WirePlumber fragment: {WP_FRAGMENT}")
     return content
@@ -545,10 +794,10 @@ def shell_entry_id(entry: Any) -> str:
 
 def plugin_enabled_in_shell_config() -> bool:
     try:
-        config = json.loads(SHELL_CONFIG.read_text(encoding="utf-8"))
+        config = json.loads(read_bounded_text(SHELL_CONFIG, MAX_CONFIG_BYTES))
     except FileNotFoundError:
         return False
-    except (OSError, json.JSONDecodeError) as exc:
+    except (PeqError, json.JSONDecodeError) as exc:
         raise PeqError(f"could not determine plugin state from {SHELL_CONFIG}: {exc}") from exc
     if not isinstance(config, dict):
         raise PeqError(f"could not determine plugin state: {SHELL_CONFIG} is not a JSON object")
@@ -582,10 +831,10 @@ def wait_for_plugin_disabled(timeout: float = 2.0) -> bool:
         time.sleep(0.05)
 
 
-def cleanup_audio_graph(state: dict[str, Any]) -> str:
+def cleanup_audio_graph(state: dict[str, Any], state_directory_fd: int | None = None) -> str:
     fragment = managed_fragment_text()
     state["enabled"] = False
-    save_state(state)
+    save_state(state, state_directory_fd)
 
     node = None
     try:
@@ -693,9 +942,9 @@ def user_presets() -> dict[str, dict[str, Any]]:
         return values
     for path in PRESET_DIR.glob("*.json"):
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(read_bounded_text(path, MAX_STATE_BYTES))
             values[str(raw["name"])[:80]] = sanitize_state(raw["state"])
-        except (OSError, KeyError, json.JSONDecodeError, PeqError):
+        except (FileNotFoundError, KeyError, json.JSONDecodeError, PeqError):
             continue
     return values
 
@@ -884,10 +1133,17 @@ def mutate(args: argparse.Namespace, state: dict[str, Any]) -> bool:
             if state["preset"] == args.name:
                 state["preset"] = "Custom"
     elif command == "import-autoeq":
-        path = Path(args.path).expanduser().resolve()
-        if not path.is_file() or path.stat().st_size > 1_000_000:
-            raise PeqError("AutoEQ input must be a regular text file smaller than 1 MB")
-        imported = parse_autoeq(path.read_text(encoding="utf-8"))
+        path = Path(args.path).expanduser()
+        try:
+            autoeq_text = read_bounded_text(
+                path,
+                1_000_000,
+                require_owner=False,
+                require_single_link=False,
+            )
+        except FileNotFoundError as exc:
+            raise PeqError(f"AutoEQ input does not exist: {path}") from exc
+        imported = parse_autoeq(autoeq_text)
         remember(state)
         enabled, snapshots, history = state["enabled"], state["snapshots"], state["history"]
         state.update(imported)
@@ -926,16 +1182,14 @@ def main() -> int:
             and not WP_FRAGMENT.exists() and not WP_FRAGMENT.is_symlink():
         print(json.dumps({"cleanup": "already-clean"}, separators=(",", ":")))
         return 0
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = load_state()
+    with locked_state_directory() as state_directory_fd:
+        state = load_state(state_directory_fd)
         try:
             if args.command == "cleanup-if-disabled" and not wait_for_plugin_disabled():
                 print(json.dumps({"cleanup": "skipped", "reason": "plugin-enabled"}, separators=(",", ":")))
                 return 0
             if args.command in {"cleanup", "cleanup-if-disabled"}:
-                mode = cleanup_audio_graph(state)
+                mode = cleanup_audio_graph(state, state_directory_fd)
                 print(json.dumps({"cleanup": mode}, separators=(",", ":")))
                 return 0
             if args.command == "status":
@@ -953,7 +1207,7 @@ def main() -> int:
                     return 0
                 state = sanitize_state(state)
                 mode = apply_state(state, previous_signature)
-                save_state(state)
+                save_state(state, state_directory_fd)
             payload = status_payload(state)
             payload["apply_mode"] = mode
             print(json.dumps(payload, separators=(",", ":")))

@@ -20,4 +20,11 @@ The controller refuses to overwrite or remove an unrecognized or symlinked
 WirePlumber fragment. Failed graph rebuilds restore the previous managed
 fragment before returning an error.
 
+Persistent state is stored in a private, user-owned directory. The controller
+locks the opened directory descriptor, reads `state.json` through a bounded
+no-follow file descriptor, rejects non-regular or multiply-linked files, and
+uses descriptor-relative atomic replacement for writes. Output from local
+commands is read incrementally with a fixed combined limit; an oversized
+producer is terminated.
+
 The exact paths and removal procedure are documented in [README.md](README.md).

@@ -3,7 +3,7 @@
   "id": "io.github.prudhviy99.parametric-eq",
   "name": "Parametric EQ",
   "description": "A full parametric PipeWire equalizer for Omarchy with live editing, headroom protection, presets, and AutoEQ import.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"

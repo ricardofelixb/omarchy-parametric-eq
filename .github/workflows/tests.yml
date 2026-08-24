@@ -33,7 +33,7 @@ jobs:
           manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
           assert manifest["schemaVersion"] == 1
           assert manifest["id"] == "io.github.prudhviy99.parametric-eq"
-          assert manifest["version"] == "1.0.0"
+          assert manifest["version"] == "1.0.1"
           assert "bar-widget" in manifest["kinds"]
           for entry_point in manifest["entryPoints"].values():
               path = Path(entry_point)
