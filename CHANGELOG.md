@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## 1.0.0 - 2026-08-20
+## 1.0.0 - 2026-08-23
 
 - Initial public release.
 - Added ten-band parametric EQ with seven filter shapes and live PipeWire
@@ -13,3 +13,6 @@ All notable changes to this project are documented here.
   commit-on-band-switch behavior.
 - Added safe user-level installation, recoverable removal, isolated tests, and
   live PipeWire integration checks.
+- Added automatic graph teardown on standard Omarchy disable/removal, guarded
+  fragment ownership, failed-rebuild rollback, and verified master bypass.
+- Added deterministic headless QML tests and lifecycle safety regressions.

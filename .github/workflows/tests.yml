@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run backend tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check Python and shell syntax
+        run: |
+          python -c 'import pathlib; path = pathlib.Path("backend/peqctl.py"); compile(path.read_text(encoding="utf-8"), str(path), "exec")'
+          bash -n scripts/install.sh scripts/uninstall.sh tests/run.sh tests/integration.sh
+      - name: Check portable manifest invariants
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path.cwd()
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["schemaVersion"] == 1
+          assert manifest["id"] == "io.github.prudhviy99.parametric-eq"
+          assert manifest["version"] == "1.0.0"
+          assert "bar-widget" in manifest["kinds"]
+          for entry_point in manifest["entryPoints"].values():
+              path = Path(entry_point)
+              assert not path.is_absolute() and ".." not in path.parts
+              assert (root / path).is_file()
+          assert not any(path.is_symlink() for path in root.rglob("*") if ".git" not in path.parts)
+          PY

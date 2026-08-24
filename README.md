@@ -44,7 +44,10 @@ WirePlumber restarts. Frequency, gain, Q, preamp, and bypass changes apply live;
 changing a filter shape or band topology may require another short restart.
 
 The Omarchy installer only clones and enables the repository. It does not run
-an install hook or request elevated privileges.
+an install hook or request elevated privileges. When the widget is disabled or
+removed, its unload guard confirms that the plugin is absent from `shell.json`,
+bypasses the EQ, removes the managed audio graph, and restarts WirePlumber.
+Ordinary shell restarts and plugin hot reloads leave the graph intact.
 
 ## Controls
 
@@ -78,7 +81,9 @@ service. It creates or updates these user-owned paths:
 
 The generated WirePlumber fragment is dedicated to this plugin. The controller
 uses `systemctl --user restart wireplumber.service` only when the graph must be
-created, removed, or structurally rebuilt.
+created, removed, or structurally rebuilt. It refuses to replace a symlink,
+non-regular file, or fragment without the plugin ownership marker, and restores
+the previous managed fragment if a graph rebuild fails.
 
 ## Command line
 
@@ -103,20 +108,24 @@ omarchy plugin update io.github.prudhviy99.parametric-eq
 
 ## Remove
 
-Run the bundled removal script before the plugin checkout is removed so the
-generated audio graph can be cleaned up safely:
+The standard Omarchy command safely disables the EQ, removes its generated
+audio graph and plugin checkout, and retains presets and state:
 
 ```sh
-plugin_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.prudhviy99.parametric-eq"
-"$plugin_dir/scripts/uninstall.sh"          # Keep presets and state
-"$plugin_dir/scripts/uninstall.sh" --purge  # Also move presets and state to trash
+omarchy plugin remove io.github.prudhviy99.parametric-eq
 ```
 
-The script disables the widget, verifies ownership of the generated fragment,
-moves material files to the desktop trash, and restarts the WirePlumber user
-service only when necessary. If the checkout was removed first, manually move
-`60-omarchy-parametric-eq.conf` out of the WirePlumber directory and restart
-WirePlumber.
+To remove presets and state as well, run the bundled uninstaller while the
+checkout still exists. The checkout and optional state are moved to the desktop
+trash:
+
+```sh
+plugin_dir="$HOME/.config/omarchy/plugins/io.github.prudhviy99.parametric-eq"
+"$plugin_dir/scripts/uninstall.sh" --purge
+```
+
+The backend also exposes `cleanup` for recovery. It verifies fragment ownership,
+bypasses processing, removes the graph, and leaves presets intact.
 
 ## Development and tests
 
@@ -129,8 +138,9 @@ WirePlumber.
 
 The isolated suite covers state validation, filter coefficients, response and
 headroom modeling, import safety, live-control behavior, manifest validation,
-QML linting, and manual-entry focus regressions. The integration test backs up
-and restores the previous EQ state and generated fragment.
+fragment ownership and rollback, unload cleanup, QML linting, and manual-entry
+focus regressions. The integration test backs up and restores the previous EQ
+state and generated fragment.
 
 ## License
 

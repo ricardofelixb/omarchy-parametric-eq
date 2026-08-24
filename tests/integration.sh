@@ -63,4 +63,7 @@ after_pid="$(systemctl --user show wireplumber.service -p MainPID --value)"
 [[ "$before_pid" != "$after_pid" ]] || { printf 'Topology edit did not rebuild WirePlumber.\n' >&2; exit 1; }
 
 "$peqctl" diagnostics | jq -e '.ok and .fragment_current and .node_present' >/dev/null
+"$peqctl" cleanup >/dev/null
+[[ ! -e "$fragment" ]] || { printf 'Cleanup left the managed fragment behind.\n' >&2; exit 1; }
+"$peqctl" status | jq -e '(.enabled | not) and (.runtime.node_present | not)' >/dev/null
 printf 'Live PipeWire integration checks passed; the previous graph will now be restored.\n'

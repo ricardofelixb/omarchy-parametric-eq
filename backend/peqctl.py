@@ -28,7 +28,10 @@ from typing import Any
 PLUGIN_ID = "io.github.prudhviy99.parametric-eq"
 SMART_NAME = "filter.sink.omarchy-parametric-eq"
 NODE_NAME = "input.omarchy.parametric-eq"
+# Bump whenever fragment structure or persistent properties change so an update
+# rebuilds the live graph even when its band topology is unchanged.
 FRAGMENT_VERSION = 1
+FRAGMENT_MARKER = f"# Managed by {PLUGIN_ID}; manual changes are overwritten."
 TYPE_LABELS = {
     "bell": "bq_peaking",
     "low-shelf": "bq_lowshelf",
@@ -101,6 +104,9 @@ WP_FRAGMENT = Path(
         "OMARCHY_PEQ_WP_FRAGMENT",
         config_home() / "wireplumber" / "wireplumber.conf.d" / "60-omarchy-parametric-eq.conf",
     )
+)
+SHELL_CONFIG = Path(
+    os.environ.get("OMARCHY_PEQ_SHELL_CONFIG", Path.home() / ".config" / "omarchy" / "shell.json")
 )
 
 
@@ -196,6 +202,20 @@ def atomic_json(path: Path, value: Any) -> None:
             os.unlink(temporary)
 
 
+def atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def load_state() -> dict[str, Any]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_FILE.exists():
@@ -238,6 +258,10 @@ def topology_signature(state: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(topology).encode()).hexdigest()[:16]
 
 
+def fragment_identity(state: dict[str, Any]) -> str:
+    return f"{FRAGMENT_VERSION}:{topology_signature(state)}"
+
+
 def fmt(value: float) -> str:
     return f"{float(value):.8g}"
 
@@ -277,7 +301,7 @@ def fragment_text(state: dict[str, Any]) -> str:
         links.append(f'          {{ output = "{previous}:Out" input = "{name}:In" }}')
         previous = name
     disabled = "false" if state["enabled"] else "true"
-    return f'''# Managed by {PLUGIN_ID}; manual changes are overwritten.
+    return f'''{FRAGMENT_MARKER}
 # fragment-version: {FRAGMENT_VERSION}
 # topology-signature: {signature}
 wireplumber.profiles = {{
@@ -325,27 +349,51 @@ wireplumber.components = [
 '''
 
 
-def current_fragment_signature() -> str | None:
-    try:
-        match = re.search(r"^# topology-signature: (\S+)$", WP_FRAGMENT.read_text(encoding="utf-8"), re.M)
-        return match.group(1) if match else None
-    except OSError:
+def managed_fragment_text() -> str | None:
+    if not WP_FRAGMENT.exists() and not WP_FRAGMENT.is_symlink():
         return None
-
-
-def write_fragment(state: dict[str, Any]) -> None:
-    WP_FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
-    content = fragment_text(state)
-    fd, temporary = tempfile.mkstemp(prefix=f".{WP_FRAGMENT.name}.", dir=WP_FRAGMENT.parent)
+    if WP_FRAGMENT.is_symlink():
+        raise PeqError(f"refusing to replace symlinked WirePlumber fragment: {WP_FRAGMENT}")
+    if not WP_FRAGMENT.is_file():
+        raise PeqError(f"WirePlumber fragment is not a regular file: {WP_FRAGMENT}")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, WP_FRAGMENT)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        content = WP_FRAGMENT.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PeqError(f"could not read WirePlumber fragment {WP_FRAGMENT}: {exc}") from exc
+    if content.splitlines()[:1] != [FRAGMENT_MARKER]:
+        raise PeqError(f"refusing to overwrite unrecognized WirePlumber fragment: {WP_FRAGMENT}")
+    return content
+
+
+def current_fragment_identity() -> str | None:
+    try:
+        content = managed_fragment_text()
+    except PeqError:
+        return None
+    if content is None:
+        return None
+    version = re.search(r"^# fragment-version: (\d+)$", content, re.M)
+    signature = re.search(r"^# topology-signature: (\S+)$", content, re.M)
+    if not version or not signature:
+        return None
+    return f"{version.group(1)}:{signature.group(1)}"
+
+
+def write_fragment(state: dict[str, Any]) -> str | None:
+    previous = managed_fragment_text()
+    content = fragment_text(state)
+    if content != previous:
+        atomic_text(WP_FRAGMENT, content)
+    return previous
+
+
+def restore_fragment(previous: str | None) -> None:
+    current = managed_fragment_text()
+    if previous is None:
+        if current is not None:
+            WP_FRAGMENT.unlink()
+    elif current != previous:
+        atomic_text(WP_FRAGMENT, previous)
 
 
 def restart_wireplumber() -> None:
@@ -393,6 +441,15 @@ def wait_for_node(timeout: float = 8.0) -> dict[str, Any] | None:
     return None
 
 
+def wait_for_node_absent(timeout: float = 8.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if find_node() is None:
+            return True
+        time.sleep(0.15)
+    return False
+
+
 def live_controls(state: dict[str, Any]) -> dict[str, float]:
     controls = {"preamp:Mult": 10 ** (effective_preamp(state) / 20)}
     for index, item in enumerate(state["bands"], 1):
@@ -428,25 +485,132 @@ def set_bypass(enabled: bool) -> bool:
 
 def apply_state(state: dict[str, Any], old_signature: str | None = None) -> str:
     desired = topology_signature(state)
-    installed = current_fragment_signature()
-    needs_restart = installed != desired or old_signature not in (None, desired)
-    write_fragment(state)
-    if needs_restart or not find_node():
-        restart_wireplumber()
-        if not wait_for_node():
-            raise PeqError("parametric EQ node was not created by WirePlumber")
-        mode = "rebuilt"
-    else:
-        mode = "live"
-    if not set_live_controls(state):
-        restart_wireplumber()
-        mode = "rebuilt"
-        if not wait_for_node():
-            raise PeqError("parametric EQ node was not created by WirePlumber")
+    installed = current_fragment_identity()
+    previous_fragment = write_fragment(state)
+    fragment_changed = previous_fragment != fragment_text(state)
+    needs_restart = installed != fragment_identity(state) or old_signature not in (None, desired)
+    restart_attempted = False
+
+    try:
+        if needs_restart or not find_node():
+            restart_attempted = True
+            restart_wireplumber()
+            if not wait_for_node():
+                raise PeqError("parametric EQ node was not created by WirePlumber")
+            mode = "rebuilt"
+        else:
+            mode = "live"
+
         if not set_live_controls(state):
-            raise PeqError("parametric EQ node did not expose writable controls")
-    set_bypass(state["enabled"])
-    return mode
+            restart_attempted = True
+            restart_wireplumber()
+            mode = "rebuilt"
+            if not wait_for_node():
+                raise PeqError("parametric EQ node was not created by WirePlumber")
+            if not set_live_controls(state):
+                raise PeqError("parametric EQ node did not expose writable controls")
+
+        if not set_bypass(state["enabled"]):
+            restart_attempted = True
+            restart_wireplumber()
+            mode = "rebuilt"
+            if not wait_for_node():
+                raise PeqError("parametric EQ node was not created by WirePlumber")
+            if not set_live_controls(state):
+                raise PeqError("parametric EQ node did not expose writable controls")
+            if not set_bypass(state["enabled"]):
+                raise PeqError("parametric EQ node did not accept the master bypass state")
+        return mode
+    except PeqError as exc:
+        rollback_errors = []
+        if fragment_changed:
+            try:
+                restore_fragment(previous_fragment)
+            except (OSError, PeqError) as rollback_exc:
+                rollback_errors.append(f"fragment rollback failed: {rollback_exc}")
+        if restart_attempted and not rollback_errors:
+            try:
+                restart_wireplumber()
+            except PeqError as rollback_exc:
+                rollback_errors.append(f"WirePlumber rollback failed: {rollback_exc}")
+        detail = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
+        raise PeqError(f"{exc}{detail}") from exc
+
+
+def shell_entry_id(entry: Any) -> str:
+    if isinstance(entry, dict):
+        return str(entry.get("id", ""))
+    return str(entry or "")
+
+
+def plugin_enabled_in_shell_config() -> bool:
+    try:
+        config = json.loads(SHELL_CONFIG.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PeqError(f"could not determine plugin state from {SHELL_CONFIG}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise PeqError(f"could not determine plugin state: {SHELL_CONFIG} is not a JSON object")
+
+    bar_config = config.get("bar", {})
+    if isinstance(bar_config, dict):
+        if shell_entry_id(bar_config.get("id")) == PLUGIN_ID:
+            return True
+        layout = bar_config.get("layout", {})
+        if isinstance(layout, dict):
+            for entries in layout.values():
+                if isinstance(entries, list) and any(shell_entry_id(entry) == PLUGIN_ID for entry in entries):
+                    return True
+    plugins = config.get("plugins", [])
+    return isinstance(plugins, list) and any(shell_entry_id(entry) == PLUGIN_ID for entry in plugins)
+
+
+def wait_for_plugin_disabled(timeout: float = 2.0) -> bool:
+    """Allow Omarchy's atomic shell.json write to catch up with QML teardown."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if not plugin_enabled_in_shell_config():
+                return True
+        except PeqError:
+            # Atomic replacement is normally immediate, but a transient read
+            # failure must never be interpreted as authorization to clean up.
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def cleanup_audio_graph(state: dict[str, Any]) -> str:
+    fragment = managed_fragment_text()
+    state["enabled"] = False
+    save_state(state)
+
+    node = None
+    try:
+        node = find_node()
+    except PeqError:
+        pass
+    if node is not None:
+        try:
+            set_bypass(False)
+        except PeqError:
+            pass
+
+    if fragment is not None:
+        try:
+            WP_FRAGMENT.unlink()
+        except OSError as exc:
+            raise PeqError(f"could not remove WirePlumber fragment {WP_FRAGMENT}: {exc}") from exc
+
+    if fragment is None and node is None:
+        return "already-clean"
+
+    restart_wireplumber()
+    if not wait_for_node_absent():
+        raise PeqError("parametric EQ node remained after cleanup")
+    return "removed"
 
 
 def biquad_coefficients(item: dict[str, Any], sample_rate: float = 48000.0) -> tuple[float, ...]:
@@ -620,6 +784,8 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("status")
     sub.add_parser("diagnostics")
     sub.add_parser("ensure")
+    sub.add_parser("cleanup")
+    sub.add_parser("cleanup-if-disabled")
     sub.add_parser("enable")
     sub.add_parser("disable")
     sub.add_parser("toggle")
@@ -749,18 +915,29 @@ def diagnostics(state: dict[str, Any]) -> dict[str, Any]:
         "commands": commands,
         "wireplumber": active,
         "fragment_exists": WP_FRAGMENT.exists(),
-        "fragment_current": current_fragment_signature() == topology_signature(state),
+        "fragment_current": current_fragment_identity() == fragment_identity(state),
         "node_present": find_node() is not None,
     }
 
 
 def main() -> int:
     args = parser().parse_args()
+    if args.command in {"cleanup", "cleanup-if-disabled"} and not STATE_DIR.exists() \
+            and not WP_FRAGMENT.exists() and not WP_FRAGMENT.is_symlink():
+        print(json.dumps({"cleanup": "already-clean"}, separators=(",", ":")))
+        return 0
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_FILE.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_state()
         try:
+            if args.command == "cleanup-if-disabled" and not wait_for_plugin_disabled():
+                print(json.dumps({"cleanup": "skipped", "reason": "plugin-enabled"}, separators=(",", ":")))
+                return 0
+            if args.command in {"cleanup", "cleanup-if-disabled"}:
+                mode = cleanup_audio_graph(state)
+                print(json.dumps({"cleanup": mode}, separators=(",", ":")))
+                return 0
             if args.command == "status":
                 print(json.dumps(status_payload(state), separators=(",", ":")))
                 return 0
@@ -775,8 +952,8 @@ def main() -> int:
                 if not mutate(args, state):
                     return 0
                 state = sanitize_state(state)
-                save_state(state)
                 mode = apply_state(state, previous_signature)
+                save_state(state)
             payload = status_payload(state)
             payload["apply_mode"] = mode
             print(json.dumps(payload, separators=(",", ":")))

@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import qs.Commons
 import qs.Ui
 
@@ -18,6 +19,7 @@ BarWidget {
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool equalizerEnabled: panelLoader.item ? panelLoader.item.equalizerEnabled === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
+  readonly property string backendPath: decodeURIComponent(String(Qt.resolvedUrl("backend/peqctl.py")).replace("file://", ""))
 
   function open() { if (panelLoader.item) panelLoader.item.openFromHotkey() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
@@ -28,6 +30,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
+  Component.onDestruction: Quickshell.execDetached([root.backendPath, "cleanup-if-disabled"])
 
   Loader {
     id: panelLoader

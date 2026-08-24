@@ -14,7 +14,11 @@ qmllint -I /usr/share/omarchy/shell \
   "$plugin_dir/EqSlider.qml" \
   "$plugin_dir/ResponseGraph.qml" \
   "$plugin_dir/Panel.qml"
-QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner \
+QT_QPA_PLATFORM=minimal \
+QT_QPA_PLATFORMTHEME= \
+QT_STYLE_OVERRIDE=Fusion \
+QT_QUICK_BACKEND=software \
+  /usr/lib/qt6/bin/qmltestrunner \
   -input "$test_dir/tst_eqslider.qml" \
   -import "$test_dir/imports" \
   -import "$plugin_dir" \
