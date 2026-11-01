@@ -34,7 +34,7 @@ SMART_NAME = "filter.sink.omarchy-parametric-eq"
 NODE_NAME = "input.omarchy.parametric-eq"
 # Bump whenever fragment structure or persistent properties change so an update
 # rebuilds the live graph even when its band topology is unchanged.
-FRAGMENT_VERSION = 2
+FRAGMENT_VERSION = 3
 FRAGMENT_MARKER = f"# Managed by {PLUGIN_ID}; manual changes are overwritten."
 # Local patch: pin the EQ to the UR28M's first output pair (its ports are aux0..aux9).
 TARGET_SINK = "alsa_output.usb-Yamaha_Corporation_Steinberg_UR28M-01.multichannel-output"
@@ -578,7 +578,7 @@ wireplumber.profiles = {{
 
 wireplumber.components = [
   {{
-    name = libpipewire-module-filter-chain, type = pw-module
+    name = libpipewire-module-filter-chain, type = pw-module-client
     arguments = {{
       node.name = "{SMART_NAME}"
       node.description = "Omarchy Parametric EQ"
@@ -615,6 +615,7 @@ wireplumber.components = [
       }}
     }}
     provides = {SMART_NAME}
+    requires = [ support.client-context ]
   }}
 ]
 '''
