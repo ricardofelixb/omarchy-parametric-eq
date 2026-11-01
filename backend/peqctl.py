@@ -34,8 +34,11 @@ SMART_NAME = "filter.sink.omarchy-parametric-eq"
 NODE_NAME = "input.omarchy.parametric-eq"
 # Bump whenever fragment structure or persistent properties change so an update
 # rebuilds the live graph even when its band topology is unchanged.
-FRAGMENT_VERSION = 1
+FRAGMENT_VERSION = 2
 FRAGMENT_MARKER = f"# Managed by {PLUGIN_ID}; manual changes are overwritten."
+# Local patch: pin the EQ to the UR28M's first output pair (its ports are aux0..aux9).
+TARGET_SINK = "alsa_output.usb-Yamaha_Corporation_Steinberg_UR28M-01.multichannel-output"
+TARGET_POSITION = "[ AUX0, AUX1 ]"
 TYPE_LABELS = {
     "bell": "bq_peaking",
     "low-shelf": "bq_lowshelf",
@@ -88,8 +91,16 @@ def _preset(gains: list[float], preamp: float = 0.0) -> dict[str, Any]:
     return state
 
 
+def _ur28m_room() -> dict[str, Any]:
+    state = default_state()
+    state["bands"][0].update(type="low-shelf", frequency=126.0, q=0.7071, gain=0.0)
+    state["bands"][1].update(type="bell", frequency=126.0, q=1.5, gain=-10.0)
+    return state
+
+
 BUILTIN_PRESETS = {
     "Flat": default_state(),
+    "UR28M Room": _ur28m_room(),
     "Bass Boost": _preset([5, 4, 3, 2, 1, 0, -0.5, -1, -1, -1], -5),
     "Bass Cut": _preset([-5, -4, -3, -2, -1, 0, 0, 0, 0, 0]),
     "Treble Boost": _preset([-1, -1, -0.5, 0, 0, 1, 2, 3, 4, 5], -5),
@@ -589,11 +600,16 @@ wireplumber.components = [
         filter.smart = true
         filter.smart.name = "{SMART_NAME}"
         filter.smart.disabled = {disabled}
+        filter.smart.target = {{ node.name = "{TARGET_SINK}" }}
         node.always-process = true
         node.dont-reconnect = false
       }}
       playback.props = {{
         node.name = "output.omarchy.parametric-eq"
+        audio.position = {TARGET_POSITION}
+        stream.dont-remix = true
+        node.dont-fallback = true
+        node.linger = true
         node.passive = true
         media.role = "DSP"
       }}
