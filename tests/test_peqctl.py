@@ -48,19 +48,15 @@ class StateTests(unittest.TestCase):
         with self.assertRaises(peqctl.PeqError):
             peqctl.sanitize_state(self.state)
 
-    def test_topology_only_changes_for_structural_edits(self):
+    def test_band_edits_never_change_topology(self):
+        # A topology change restarts WirePlumber and drops every stream.
         original = peqctl.topology_signature(self.state)
-        gain_change = copy.deepcopy(self.state)
-        gain_change["bands"][3]["gain"] = 8
-        self.assertEqual(original, peqctl.topology_signature(gain_change))
-        type_change = copy.deepcopy(self.state)
-        type_change["bands"][3]["type"] = "notch"
-        self.assertNotEqual(original, peqctl.topology_signature(type_change))
-        non_gain_filter = copy.deepcopy(self.state)
-        non_gain_filter["bands"][3]["type"] = "notch"
-        active_notch = peqctl.topology_signature(non_gain_filter)
-        non_gain_filter["bands"][3]["enabled"] = False
-        self.assertNotEqual(active_notch, peqctl.topology_signature(non_gain_filter))
+        edited = copy.deepcopy(self.state)
+        edited["bands"][3].update(type="notch", gain=8)
+        self.assertEqual(original, peqctl.topology_signature(edited))
+        edited["bands"][3]["enabled"] = False
+        self.assertEqual(original, peqctl.topology_signature(edited))
+        self.assertEqual(peqctl.band_coefficients(edited["bands"][3], 48000), (1.0, 0.0, 0.0, 1.0, 0.0, 0.0))
 
     def test_fragment_contains_linear_preamp_and_all_bands(self):
         self.state["enabled"] = True
@@ -209,7 +205,7 @@ class RuntimeCommandTests(unittest.TestCase):
         command = run_mock.call_args.args[0]
         self.assertEqual(command[:4], ["pw-cli", "set-param", "72", "Props"])
         self.assertIn('"preamp:Mult"', command[4])
-        self.assertIn('"band_10:Q"', command[4])
+        self.assertIn('"band_10:b0"', command[4])
         self.assertNotIn("sh -c", " ".join(command))
 
     @mock.patch.object(peqctl, "find_node", return_value={"id": 88})
@@ -245,10 +241,11 @@ class FragmentSafetyTests(unittest.TestCase):
     @mock.patch.object(peqctl, "restart_wireplumber")
     def test_failed_rebuild_restores_previous_fragment(self, restart_mock):
         previous_state = peqctl.default_state()
-        previous = peqctl.fragment_text(previous_state)
+        previous = peqctl.fragment_text(previous_state).replace(
+            f"# fragment-version: {peqctl.FRAGMENT_VERSION}", "# fragment-version: 0"
+        )
         peqctl.WP_FRAGMENT.write_text(previous, encoding="utf-8")
         next_state = copy.deepcopy(previous_state)
-        next_state["bands"][3]["type"] = "notch"
         restart_mock.side_effect = [peqctl.PeqError("restart failed"), None]
 
         with self.assertRaisesRegex(peqctl.PeqError, "restart failed"):

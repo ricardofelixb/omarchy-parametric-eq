@@ -34,7 +34,7 @@ SMART_NAME = "filter.sink.omarchy-parametric-eq"
 NODE_NAME = "input.omarchy.parametric-eq"
 # Bump whenever fragment structure or persistent properties change so an update
 # rebuilds the live graph even when its band topology is unchanged.
-FRAGMENT_VERSION = 3
+FRAGMENT_VERSION = 4
 FRAGMENT_MARKER = f"# Managed by {PLUGIN_ID}; manual changes are overwritten."
 # Local patch: pin the EQ to the UR28M's first output pair (its ports are aux0..aux9).
 TARGET_SINK = "alsa_output.usb-Yamaha_Corporation_Steinberg_UR28M-01.multichannel-output"
@@ -49,6 +49,11 @@ TYPE_LABELS = {
     "band-pass": "bq_bandpass",
 }
 GAIN_TYPES = {"bell", "low-shelf", "high-shelf"}
+# Every band is a bq_raw biquad fed coefficients computed here, so changing a
+# band's type or disabling it is a live update instead of a graph rebuild.
+COEFFICIENT_NAMES = ("b0", "b1", "b2", "a0", "a1", "a2")
+COEFFICIENT_LIMIT = 9.9  # bq_raw clamps each coefficient port to -10..10
+CONFIG_RATES = (44100, 48000, 88200, 96000, 176400, 192000)
 DEFAULT_FREQUENCIES = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 MAX_STATE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
@@ -520,7 +525,7 @@ def run(
 
 
 def topology_signature(state: dict[str, Any]) -> str:
-    topology = [TYPE_LABELS[item["type"]] if item["enabled"] else "bq_peaking" for item in state["bands"]]
+    topology = ["bq_raw"] * len(state["bands"])
     return hashlib.sha256(json.dumps(topology).encode()).hexdigest()[:16]
 
 
@@ -552,15 +557,21 @@ def fragment_text(state: dict[str, Any]) -> str:
     previous = "preamp"
     for index, item in enumerate(state["bands"], 1):
         name = f"band_{index}"
-        label = TYPE_LABELS[item["type"]] if item["enabled"] else "bq_peaking"
-        gain = item["gain"] if item["enabled"] and item["type"] in GAIN_TYPES else 0.0
+        tables = []
+        for rate in CONFIG_RATES:
+            values = " ".join(f"{key} = {fmt(value)}" for key, value in zip(COEFFICIENT_NAMES, band_coefficients(item, rate)))
+            tables.append(f"                {{ rate = {rate} {values} }}")
         nodes.extend(
             [
                 "          {",
                 "            type = builtin",
                 f"            name = {name}",
-                f"            label = {label}",
-                f'            control = {{ "Freq" = {fmt(item["frequency"])} "Q" = {fmt(item["q"])} "Gain" = {fmt(gain)} }}',
+                "            label = bq_raw",
+                "            config = {",
+                "              coefficients = [",
+                *tables,
+                "              ]",
+                "            }",
                 "          }",
             ]
         )
@@ -716,12 +727,18 @@ def wait_for_node_absent(timeout: float = 8.0) -> bool:
     return False
 
 
-def live_controls(state: dict[str, Any]) -> dict[str, float]:
+def graph_rate() -> int:
+    result = run(["pw-metadata", "-n", "settings", "0", "clock.rate"], check=False)
+    match = re.search(r"value:'(\d+)'", result.stdout or "")
+    return int(match.group(1)) if result.returncode == 0 and match else 48000
+
+
+def live_controls(state: dict[str, Any], rate: int | None = None) -> dict[str, float]:
+    rate = rate or graph_rate()
     controls = {"preamp:Mult": 10 ** (effective_preamp(state) / 20)}
     for index, item in enumerate(state["bands"], 1):
-        controls[f"band_{index}:Freq"] = item["frequency"]
-        controls[f"band_{index}:Q"] = item["q"]
-        controls[f"band_{index}:Gain"] = item["gain"] if item["enabled"] and item["type"] in GAIN_TYPES else 0.0
+        for key, value in zip(COEFFICIENT_NAMES, band_coefficients(item, rate)):
+            controls[f"band_{index}:{key}"] = value
     return controls
 
 
@@ -892,8 +909,7 @@ def biquad_coefficients(item: dict[str, Any], sample_rate: float = 48000.0) -> t
         b0, b1, b2 = 1 + alpha * a, -2 * cosine, 1 - alpha * a
         a0, a1, a2 = 1 + alpha / a, -2 * cosine, 1 - alpha / a
     elif kind in {"low-shelf", "high-shelf"}:
-        shelf_alpha = sine / 2 * math.sqrt(max(0, (a + 1 / a) * (1 / q - 1) + 2))
-        root = 2 * math.sqrt(a) * shelf_alpha
+        root = 2 * math.sqrt(a) * alpha
         if kind == "low-shelf":
             b0 = a * ((a + 1) - (a - 1) * cosine + root)
             b1 = 2 * a * ((a - 1) - (a + 1) * cosine)
@@ -921,6 +937,17 @@ def biquad_coefficients(item: dict[str, Any], sample_rate: float = 48000.0) -> t
         b0, b1, b2 = alpha, 0, -alpha
         a0, a1, a2 = 1 + alpha, -2 * cosine, 1 - alpha
     return b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0
+
+
+def band_coefficients(item: dict[str, Any], sample_rate: float) -> tuple[float, ...]:
+    """Unnormalized bq_raw coefficients; a disabled band passes audio through."""
+    if not item["enabled"]:
+        return 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+    b0, b1, b2, a1, a2 = biquad_coefficients(item, sample_rate)
+    values = (b0, b1, b2, 1.0, a1, a2)
+    # bq_raw divides by a0, so shrinking all six keeps the filter identical.
+    scale = max(1.0, max(abs(value) for value in values) / COEFFICIENT_LIMIT)
+    return tuple(value / scale for value in values)
 
 
 def response_db(state: dict[str, Any], frequency: float, include_preamp: bool = True) -> float:
